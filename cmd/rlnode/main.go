@@ -16,6 +16,14 @@ import (
 	"time"
 )
 
+func startServer(name string, server *http.Server) {
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("%s server error: %v", name, err)
+		}
+	}()
+}
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -37,13 +45,16 @@ func main() {
 
 	cancelPing()
 
-	router := http.NewServeMux()
+	appRouter := http.NewServeMux()
 
-	router.HandleFunc("/ping", handler.Ping)
+	appRouter.HandleFunc("/ping", handler.Ping)
 
-	rateLimitedHandler := middleware.RateLimit(client, cfg.RateLimit, cfg.Window, cfg.JWTSecret)(router)
+	metricsRouter := http.NewServeMux()
+	metricsRouter.Handle("/metrics", handler.Metrics())
 
-	server := &http.Server{
+	rateLimitedHandler := middleware.RateLimit(client, cfg.RateLimit, cfg.Window, cfg.JWTSecret)(appRouter)
+
+	appServer := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           rateLimitedHandler,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -51,14 +62,21 @@ func main() {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	fmt.Printf("SERVER Starting to Listen on the port %s\n", cfg.Port)
+	fmt.Printf("App SERVER Starting to Listen on the port %s\n", cfg.Port)
 
-	go func() {
+	startServer("Application", appServer)
+	metricsServer := &http.Server{
+		Addr:              ":" + cfg.MetricsPort,
+		Handler:           metricsRouter,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Server error %v", err)
-		}
-	}()
+	fmt.Printf("METRICS SERVER Starting to Listen on the port %s\n", cfg.MetricsPort)
+
+	startServer("Metrics", metricsServer)
 
 	shutdownChannel := make(chan os.Signal, 1)
 	signal.Notify(shutdownChannel, os.Interrupt, syscall.SIGTERM)
@@ -66,13 +84,20 @@ func main() {
 
 	<-shutdownChannel
 
-	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelShutdown()
+	appCtx, appCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer appCancel()
 
-	if err := server.Shutdown(shutdownContext); err != nil {
+	if err := appServer.Shutdown(appCtx); err != nil {
 		log.Printf("Graceful Shutdown failed: %v", err)
 	} else {
-		log.Println("Server shut down cleanly")
+		log.Println("Application Server shut down cleanly")
 	}
 
+	metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer metricsCancel()
+	if err := metricsServer.Shutdown(metricsCtx); err != nil {
+		log.Printf("Graceful Shutdown failed: %v", err)
+	} else {
+		log.Println("Metrics Server shut down cleanly")
+	}
 }

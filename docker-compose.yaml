@@ -15,8 +15,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    expose:
+      - "8080"
+      - "9091"
     environment:
       PORT: 8080
+      METRICS_PORT: 9091
       REDIS_ADDR: redis:6379
       JWT_SECRET: ${JWT_SECRET}
       RATE_LIMIT: 50
@@ -32,8 +36,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    expose:
+      - "8080"
+      - "9091"
     environment:
       PORT: 8080
+      METRICS_PORT: 9091
       REDIS_ADDR: redis:6379
       JWT_SECRET: ${JWT_SECRET}
       RATE_LIMIT: 50
@@ -49,9 +57,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-
+    expose:
+      - "8080"
+      - "9091"
     environment:
       PORT: 8080
+      METRICS_PORT: 9091
       REDIS_ADDR: redis:6379
       JWT_SECRET: ${JWT_SECRET}
       RATE_LIMIT: 50

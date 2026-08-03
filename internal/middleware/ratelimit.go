@@ -10,6 +10,7 @@ import (
 
 	jwt "github.com/golang-jwt/jwt/v5"
 
+	"github.com/prometheus/client_golang/prometheus"
 	redisClient "github.com/redis/go-redis/v9"
 )
 
@@ -117,6 +118,7 @@ func RateLimit(
 
 			member := strconv.FormatInt(now.UnixNano(), 10) + "-" + strconv.Itoa(rand.Intn(1000000))
 
+			start := time.Now()
 			result, err := rateLimitScript.Run(
 				ctx,
 				client,
@@ -126,19 +128,50 @@ func RateLimit(
 				limit,
 				member,
 			).Int()
+			duration := time.Since(start)
 
 			if err != nil {
 				http.Error(response, "Internal Server Error", http.StatusInternalServerError)
 				return
 			}
-
+			// Only observe duration and increment counter on successful Redis calls
+			requestDuration.WithLabelValues(clientID).Observe(duration.Seconds())
 			if result == 0 {
+
+				requestsTotal.
+					WithLabelValues(clientID, "denied").
+					Inc()
 				response.Header().Set("Retry-After", strconv.Itoa(int(window.Seconds())))
 				http.Error(response, "Too Many Requests", http.StatusTooManyRequests)
 				return
 			}
 
+			requestsTotal.
+				WithLabelValues(clientID, "allowed").
+				Inc()
 			next.ServeHTTP(response, request)
 		})
 	}
+}
+
+var requestsTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "ratelimiter_requests_total",
+		Help: "Total requests processed by the rate limiter",
+	},
+	[]string{"client_id", "result"},
+)
+
+var requestDuration = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "ratelimiter_request_duration_seconds",
+		Help:    "Time spent processing rate limit requests",
+		Buckets: []float64{.0001, .0005, .001, .005, .01, .025, .05, .1},
+	},
+	[]string{"client_id"},
+)
+
+func init() {
+	prometheus.MustRegister(requestsTotal)
+	prometheus.MustRegister(requestDuration)
 }

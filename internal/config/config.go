@@ -8,11 +8,12 @@ import (
 )
 
 type Config struct {
-	Port      string
-	RedisAddr string
-	RateLimit int
-	Window    time.Duration
-	JWTSecret string
+	Port        string
+	MetricsPort string
+	RedisAddr   string
+	RateLimit   int
+	Window      time.Duration
+	JWTSecret   string
 }
 
 func Load() (Config, error) {
@@ -21,6 +22,11 @@ func Load() (Config, error) {
 		port = "8080"
 	}
 
+	metricsPort := os.Getenv("METRICS_PORT")
+
+	if metricsPort == "" {
+		metricsPort = "9091"
+	}
 	redisAddr := os.Getenv("REDIS_ADDR")
 	if redisAddr == "" {
 		redisAddr = "localhost:6379"
@@ -72,10 +78,11 @@ func Load() (Config, error) {
 	}
 
 	return Config{
-		Port:      port,
-		RedisAddr: redisAddr,
-		RateLimit: rateLimit,
-		Window:    window,
-		JWTSecret: jwtSecret,
+		Port:        port,
+		MetricsPort: metricsPort,
+		RedisAddr:   redisAddr,
+		RateLimit:   rateLimit,
+		Window:      window,
+		JWTSecret:   jwtSecret,
 	}, nil
 }
