@@ -1,6 +1,6 @@
 # Distributed Rate Limiter
 
-A production-grade distributed rate limiter built in Go, featuring a sliding window counter algorithm, JWT-based per-client identity, atomic Redis operations via Lua scripting, and a full observability stack.
+A production-grade distributed rate limiter built in Go, featuring two pluggable rate limiting algorithms, JWT-based per-client identity, atomic Redis operations via Lua scripting, and a full observability stack.
 
 ---
 
@@ -8,7 +8,7 @@ A production-grade distributed rate limiter built in Go, featuring a sliding win
 
 ```
 Clients → Nginx (load balancer) → RL Node 1 ┐
-                                 → RL Node 2 ├→ Redis (shared state) → Raft KV Store
+                                 → RL Node 2 ├→ Redis (shared state)
                                  → RL Node 3 ┘
 
 Prometheus → scrapes RL Node 1, 2, 3 (:9091/metrics)
@@ -19,41 +19,101 @@ Grafana    → visualizes request rate + p99 latency
 1. Client sends a request with a JWT in the `Authorization: Bearer <token>` header
 2. Nginx load balances across 3 RL nodes (round-robin)
 3. The RL node verifies the JWT signature (HS256) and extracts the `sub` claim as the client identity
-4. An atomic Lua script runs against shared Redis to check the sliding window counter
-5. If the client is within the limit → request is forwarded; if over → `429 Too Many Requests` with a `Retry-After` header is returned immediately
+4. An atomic Lua script runs against shared Redis to check the rate limit
+5. If within limit → request is forwarded; if over → `429 Too Many Requests` with a `Retry-After` header is returned immediately
 
 ---
 
-## Algorithm: Sliding Window Counter
+## Algorithms
 
-The rate limiter uses a **sliding window counter** backed by a Redis sorted set.
+Two algorithms are implemented and selectable via the `ALGORITHM` environment variable.
 
-Each request is stored as a member with its Unix timestamp as the score. On every incoming request:
+### Sliding Window Counter (`ALGORITHM=sliding_window`)
+
+Each request is stored in a Redis sorted set with its Unix timestamp as the score. On every incoming request:
 
 1. Remove all entries older than `now - window` via `ZREMRANGEBYSCORE`
 2. Count remaining entries via `ZCARD`
-3. If count ≥ limit → deny and return `0`
-4. Otherwise add the current request via `ZADD` and return `1`
+3. If count ≥ limit → deny, return `0`
+4. Otherwise add current request via `ZADD`, return `1`
 
-The entire script runs atomically inside Redis — no race conditions between the increment and expiry steps.
+**Why sorted set over a simple counter:**
+A simple counter can't implement sliding window — it has no memory of *when* requests happened. The sorted set stores each request with its timestamp as the score, enabling "how many requests in the last N seconds" queries.
 
-**Why sliding window counter over alternatives:**
+**The approximation tradeoff:**
+Sliding window counter is an approximation, not exact. It assumes requests were evenly distributed across the previous window. The true sliding window log stores every request timestamp and is perfectly accurate but uses O(n) memory per client. Sliding window counter trades a small accuracy margin for O(1) memory — the right tradeoff at scale.
 
-| Algorithm | Memory | Accuracy | Notes |
-|---|---|---|---|
-| Fixed window counter | O(1) | Low | Vulnerable to boundary attacks — 2× traffic possible at window edges |
-| Sliding window counter | O(1) | High (approximation) | Prevents boundary attacks; trades perfect accuracy for O(1) memory |
-| Window log | O(n) | Exact | Stores every request timestamp; memory grows with traffic |
+### Token Bucket (`ALGORITHM=token_bucket`)
 
-Sliding window counter was chosen because it prevents boundary attacks with O(1) memory per client — the right tradeoff at scale.
+Each client has a bucket with a maximum capacity equal to the rate limit. Tokens refill continuously at a fixed rate (`limit / window`). Each request consumes one token.
+
+State stored per client in a Redis Hash:
+- `tokens` — current token count
+- `last_refill` — Unix timestamp of last request
+
+On every incoming request:
+1. Read `tokens` and `last_refill` from Redis
+2. Calculate elapsed time since last refill
+3. Add `elapsed * refill_rate` tokens, capped at capacity
+4. If tokens < 1 → deny
+5. Otherwise consume one token and persist updated state
+
+---
+
+## Algorithm Comparison
+
+### Behavioral difference — proven experimentally
+
+**Setup:** limit = 10 requests, window = 60 seconds
+
+**Test:** Exhaust the limit, wait 30 seconds, send 5 more requests.
+
+| Algorithm | After 30s wait | Result |
+|---|---|---|
+| Token bucket | 5 x 200 | Tokens refilled continuously at 1 token/6s |
+| Sliding window counter | 5 x 429 | All 10 original requests still within the 60s window |
+
+Sliding window counter blocked everything because the 60 second window hadn't expired — all 10 original requests were still counted. Token bucket allowed 5 because tokens refill independently of when original requests happened.
+
+### When to use each
+
+**Use sliding window counter when:**
+- You need strict rate enforcement regardless of client behavior
+- Protecting backend resources from any spike, including bursty legitimate traffic
+- Memory efficiency is critical (O(1) per client)
+- Boundary attack prevention matters — sliding window eliminates the fixed window exploit where a client can send 2× traffic at window edges
+
+**Use token bucket when:**
+- Clients legitimately need burst capacity (e.g. batch operations, mobile sync)
+- You want to allow accumulated capacity to be spent at once
+- Smoother traffic shaping is preferred over hard cutoffs
+
+### Refill rate calculation
+
+```
+refill_rate = limit / window_seconds
+```
+
+Example: 10 requests per 60 seconds → 1 token refills every 6 seconds. After a 30 second wait, 5 tokens are available.
+
+### Key tradeoffs
+
+| Property | Sliding Window Counter | Token Bucket |
+|---|---|---|
+| Memory per client | O(1) | O(1) |
+| Accuracy | Approximation | Exact |
+| Burst handling | No — strict enforcement | Yes — up to bucket capacity |
+| Boundary attacks | Prevented | Prevented |
+| Implementation complexity | Moderate | Moderate |
+| Redis data structure | Sorted set | Hash |
 
 ---
 
 ## Key Design Decisions
 
-**Atomic Lua script over INCR + EXPIRE**
+**Atomic Lua scripts over INCR + EXPIRE**
 
-A naive `INCR` followed by `EXPIRE` has a race condition: if the process crashes between the two calls, the key lives in Redis forever with no TTL, permanently blocking that client. The Lua script runs atomically — Redis guarantees no other command executes between its lines.
+A naive `INCR` followed by `EXPIRE` has a race condition: if the process crashes between the two calls, the key lives in Redis forever with no TTL, permanently blocking that client. Both Lua scripts run atomically — Redis guarantees no other command executes between script lines.
 
 **JWT subject as Redis key**
 
@@ -63,9 +123,13 @@ Rate limiting by IP address breaks behind proxies and NATs where many clients sh
 
 The `/metrics` endpoint runs on port `9091`, separate from the main application on port `8080`. If metrics shared the rate-limited port, Prometheus scraping would consume request budget and eventually get blocked — breaking observability precisely when you need it most under high load.
 
-**Fail open on Redis error**
+**Fail closed on Redis error**
 
-If Redis is unavailable, the middleware returns `500 Internal Server Error` rather than silently allowing all traffic through. This is a deliberate choice: silent fail-open masks infrastructure failures and can allow abuse during outages.
+If Redis is unavailable, the middleware returns `500 Internal Server Error`. Silent fail-open would mask infrastructure failures and allow abuse during outages.
+
+**`service_healthy` condition in Docker Compose**
+
+RL nodes wait for Redis to pass its healthcheck before starting, not just for the container to exist. This prevents startup failures when Redis takes a moment to initialize.
 
 ---
 
@@ -74,9 +138,9 @@ If Redis is unavailable, the middleware returns `500 Internal Server Error` rath
 | Component | Technology |
 |---|---|
 | Rate limiter nodes | Go (`net/http`, `go-redis/v9`) |
-| Shared state | Redis 7 (sorted sets + Lua scripting) |
+| Shared state | Redis 7 (sorted sets + hashes + Lua scripting) |
 | Load balancer | Nginx |
-| Auth | JWT (HS256 via `golang-jwt/jwt/v5`) |
+| Auth | JWT HS256 (`golang-jwt/jwt/v5`) |
 | Metrics | Prometheus + Grafana |
 | Orchestration | Docker Compose |
 
@@ -98,7 +162,8 @@ ratelimiter/
 │   │   ├── ping.go          # GET /ping handler
 │   │   └── metrics.go       # GET /metrics handler (Prometheus)
 │   ├── middleware/
-│   │   └── ratelimit.go     # Sliding window counter middleware + Lua script
+│   │   ├── ratelimit.go     # Sliding window counter middleware + Lua script
+│   │   └── tokenbucket.go   # Token bucket middleware + Lua script
 │   └── redis/
 │       └── client.go        # Redis client factory
 ├── nginx/
@@ -136,7 +201,7 @@ TOKEN=$(JWT_SECRET=your-secret go run cmd/tokengen/main.go --subject client-a)
 curl -H "Authorization: Bearer $TOKEN" http://localhost/ping
 ```
 
-**5. Test rate limiting (default limit: 10 requests per 60s):**
+**5. Test rate limiting:**
 ```bash
 for i in {1..12}; do
   curl -s -o /dev/null -w "%{http_code}\n" \
@@ -144,6 +209,13 @@ for i in {1..12}; do
     http://localhost/ping
 done
 # Expected: 10x 200, 2x 429
+```
+
+**6. Switch algorithms:**
+```bash
+# In docker-compose.yaml, set ALGORITHM=token_bucket on each RL node
+# Or locally:
+ALGORITHM=token_bucket JWT_SECRET=your-secret go run cmd/rlnode/main.go
 ```
 
 **Services:**
@@ -157,8 +229,6 @@ done
 
 ## Configuration
 
-All configuration is environment-variable driven:
-
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8080` | RL node application port |
@@ -167,6 +237,7 @@ All configuration is environment-variable driven:
 | `JWT_SECRET` | required | HMAC secret for JWT verification |
 | `RATE_LIMIT` | `10` | Max requests per window |
 | `WINDOW` | `60s` | Window size (e.g. `60s`, `1m`, `2m30s`) |
+| `ALGORITHM` | `sliding_window` | Algorithm: `sliding_window` or `token_bucket` |
 
 ---
 
@@ -178,7 +249,7 @@ Prometheus scrapes all 3 RL nodes every 15 seconds on `:9091/metrics`.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `ratelimiter_requests_total` | Counter | `client_id`, `result` | Total requests, labeled allowed/denied |
+| `ratelimiter_requests_total` | Counter | `client_id`, `result` | Total requests labeled allowed/denied |
 | `ratelimiter_request_duration_seconds` | Histogram | `client_id` | Lua script execution latency |
 
 **Grafana queries:**
@@ -199,9 +270,9 @@ histogram_quantile(0.99, rate(ratelimiter_request_duration_seconds_bucket[1m]))
 
 ## Chaos Testing
 
-**Test: Node failure mid-traffic**
+**Test 1: Node failure mid-traffic**
 
-Killed `rl2` after ~10 requests while running 50 concurrent requests through Nginx:
+Killed `rl2` after ~10 requests while running 50 requests through Nginx:
 
 ```bash
 # Terminal 1 — traffic
@@ -217,23 +288,24 @@ sleep 5 && docker stop ratelimiter-rl2-1
 ```
 
 **Results:**
-- 50/50 requests returned `200` — **0% error rate**
-- Nginx detected the failure and rerouted to rl1 and rl3 within one request cycle
-- Rate limit counts remained accurate on surviving nodes (shared Redis state)
+- 50/50 requests returned `200` — 0% error rate
+- Nginx detected failure and rerouted to rl1 and rl3 within one request cycle
+- Rate limit counts remained accurate on surviving nodes via shared Redis state
 
-**Test: Node recovery**
+**Test 2: Node recovery**
 
-Restarted rl2 with `docker start ratelimiter-rl2-1`:
+```bash
+docker start ratelimiter-rl2-1
+```
+
 - rl2 rejoined the cluster automatically
 - Subsequent 50-request test: 50/50 `200` responses
-- No manual intervention required beyond the start command
+- No manual intervention required
 
 ---
 
 ## What's Next
 
-- [ ] Token bucket algorithm implementation
-- [ ] Window log algorithm implementation  
-- [ ] Benchmark all three algorithms at load (p99 latency, memory per client, accuracy)
+- [ ] Benchmarks with real load numbers (p99 latency, throughput at 1K/5K RPS)
 - [ ] Unit tests for middleware and Lua script logic
 - [ ] AWS deployment (ECS + ElastiCache)

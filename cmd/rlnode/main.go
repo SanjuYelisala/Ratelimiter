@@ -52,8 +52,14 @@ func main() {
 	metricsRouter := http.NewServeMux()
 	metricsRouter.Handle("/metrics", handler.Metrics())
 
-	rateLimitedHandler := middleware.RateLimit(client, cfg.RateLimit, cfg.Window, cfg.JWTSecret)(appRouter)
-
+	var rateLimitedHandler http.Handler
+	switch cfg.Algorithm {
+	case "token_bucket":
+		rateLimitedHandler = middleware.TokenBucket(client, cfg.RateLimit, cfg.Window, cfg.JWTSecret)(appRouter)
+	default:
+		rateLimitedHandler = middleware.RateLimit(client, cfg.RateLimit, cfg.Window, cfg.JWTSecret)(appRouter)
+	}
+	log.Printf("Using algorithm: %s", cfg.Algorithm)
 	appServer := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           rateLimitedHandler,

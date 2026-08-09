@@ -14,6 +14,7 @@ type Config struct {
 	RateLimit   int
 	Window      time.Duration
 	JWTSecret   string
+	Algorithm   string
 }
 
 func Load() (Config, error) {
@@ -77,6 +78,16 @@ func Load() (Config, error) {
 		window = parsed
 	}
 
+	algorithm := os.Getenv("ALGORITHM")
+	if algorithm == "" {
+		algorithm = "sliding_window"
+	}
+	if algorithm != "sliding_window" && algorithm != "token_bucket" {
+		return Config{}, fmt.Errorf(
+			"invalid ALGORITHM %q: must be sliding_window or token_bucket",
+			algorithm,
+		)
+	}
 	return Config{
 		Port:        port,
 		MetricsPort: metricsPort,
@@ -84,5 +95,6 @@ func Load() (Config, error) {
 		RateLimit:   rateLimit,
 		Window:      window,
 		JWTSecret:   jwtSecret,
+		Algorithm:   algorithm,
 	}, nil
 }
