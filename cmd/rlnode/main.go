@@ -52,6 +52,10 @@ func main() {
 	metricsRouter := http.NewServeMux()
 	metricsRouter.Handle("/metrics", handler.Metrics())
 
+	// Public router — no rate limiting
+	publicRouter := http.NewServeMux()
+	publicRouter.HandleFunc("/health", handler.Health)
+
 	var rateLimitedHandler http.Handler
 	switch cfg.Algorithm {
 	case "token_bucket":
@@ -59,10 +63,20 @@ func main() {
 	default:
 		rateLimitedHandler = middleware.RateLimit(client, cfg.RateLimit, cfg.Window, cfg.JWTSecret)(appRouter)
 	}
+
 	log.Printf("Using algorithm: %s", cfg.Algorithm)
+
+	// Chain — check health first, then rate limit everything else
+	mainHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			publicRouter.ServeHTTP(w, r)
+			return
+		}
+		rateLimitedHandler.ServeHTTP(w, r)
+	})
 	appServer := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           rateLimitedHandler,
+		Handler:           mainHandler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

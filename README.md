@@ -109,6 +109,46 @@ Example: 10 requests per 60 seconds → 1 token refills every 6 seconds. After a
 
 ---
 
+## Benchmark Results
+
+**Setup:** 200 requests, 10 concurrent workers, localhost, limit = 10 req/60s.
+Each run used a unique JWT subject to ensure a fresh Redis state with no carry-over from previous runs.
+Tool: [hey](https://github.com/rakyll/hey)
+
+### Sliding Window Counter
+
+| Run | p50 | p99 | Req/sec |
+|---|---|---|---|
+| 1 | 0.7ms | 11.0ms | 7,209 |
+| 2 | 0.7ms | 9.2ms | 8,439 |
+| 3 | 0.7ms | 6.1ms | 10,338 |
+| **Average** | **0.7ms** | **8.8ms** | **8,662** |
+
+### Token Bucket
+
+| Run | p50 | p99 | Req/sec |
+|---|---|---|---|
+| 1 | 1.0ms | 23.2ms | 4,878 |
+| 2 | 0.7ms | 7.6ms | 8,990 |
+| 3 | 0.7ms | 7.5ms | 8,601 |
+| **Average** | **0.8ms** | **12.8ms** | **7,490** |
+
+### Analysis
+
+| Metric | Sliding Window Counter | Token Bucket | Winner |
+|---|---|---|---|
+| p50 latency | 0.7ms | 0.8ms | Sliding window |
+| p99 latency | 8.8ms | 12.8ms | Sliding window |
+| Throughput | 8,662 req/sec | 7,490 req/sec | Sliding window |
+
+Sliding window counter outperforms token bucket at both p99 latency and throughput. The likely reason: sorted set operations (`ZREMRANGEBYSCORE` + `ZCARD` + `ZADD`) are simpler for Redis to execute than hash read-modify-write (`HGETALL` + `HSET`) under concurrent load, because hash operations require reading and deserializing multiple fields before writing back.
+
+**Caveat:** These benchmarks run on localhost with no network latency. In a real deployment where Go nodes and Redis are on separate machines (1-2ms network latency), both algorithms would show higher absolute latency. The relative difference between them is expected to hold.
+
+**Production recommendation:** Use sliding window counter as the default. Switch to token bucket only when clients have legitimate burst requirements (e.g. batch jobs, mobile sync operations that accumulate offline).
+
+---
+
 ## Key Design Decisions
 
 **Atomic Lua scripts over INCR + EXPIRE**
@@ -306,6 +346,6 @@ docker start ratelimiter-rl2-1
 
 ## What's Next
 
-- [ ] Benchmarks with real load numbers (p99 latency, throughput at 1K/5K RPS)
 - [ ] Unit tests for middleware and Lua script logic
 - [ ] AWS deployment (ECS + ElastiCache)
+- [ ] Benchmark results under real network latency (cross-region nodes)
